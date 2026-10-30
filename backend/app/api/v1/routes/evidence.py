@@ -133,6 +133,16 @@ async def upload_evidence(
     db.add(evidence)
     db.flush()
 
+    # Record review history for the initial upload state
+    history = EvidenceReviewHistory(
+        evidence_id=evidence.id,
+        previous_status=None,
+        new_status=EvidenceStatus.UPLOADED.value,
+        changed_by=current_user.id,
+        reason="Evidence uploaded",
+    )
+    db.add(history)
+
     # Record audit
     record_audit(
         db,

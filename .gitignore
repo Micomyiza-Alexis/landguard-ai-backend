@@ -36,5 +36,9 @@ build/
 # Trained model binaries
 *.joblib
 
+# Local runtime evidence storage
+backend/storage/
+storage/
+
 # Misc
 *.bak
