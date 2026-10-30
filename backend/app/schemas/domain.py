@@ -178,6 +178,9 @@ class TransactionOut(BaseModel):
     buyer_owner_id: Optional[int] = None
     buyer_name: Optional[str] = None
     transaction_type: str
+    is_disposable: bool = False
+    is_archived: bool = False
+    archived_at: Optional[datetime] = None
     transaction_date: datetime
     declared_value: Optional[Decimal] = None
     status: str

@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, Numeric, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.transaction_status import TransactionStatus
 from app.db.base import Base
@@ -41,6 +41,10 @@ class Transaction(Base):
         onupdate=datetime.utcnow,
         nullable=False,
     )
+    is_disposable: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    archived_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
 
     parcel: Mapped["Parcel"] = relationship(back_populates="transactions")
     evidence: Mapped[list["Evidence"]] = relationship(back_populates="transaction")

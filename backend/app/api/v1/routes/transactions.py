@@ -3,10 +3,11 @@ from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.models.case_review import CaseReview
+from app.models.case_review import CaseReview, CaseStatusHistory
 from app.models.evidence import Evidence, EvidenceReviewHistory
 
 from app.models.owner import Owner
@@ -25,6 +26,7 @@ from app.core.transaction_status import TransactionStatus
 
 router = APIRouter(prefix="/transactions", tags=["Transactions"])
 write_roles = require_roles("ADMIN", "OFFICER")
+delete_roles = require_roles("ADMIN")
 read_roles = require_roles("ADMIN", "OFFICER", "AUDITOR")
 
 
@@ -32,6 +34,10 @@ read_roles = require_roles("ADMIN", "OFFICER", "AUDITOR")
 class TransactionStatusUpdate(BaseModel):
     status: str
     reason: str | None = None
+
+
+class TransactionDeletionRequest(BaseModel):
+    reason: str
 
 
 VALID_STATUS_TRANSITIONS = {
@@ -291,55 +297,128 @@ def get_transaction_status_history(transaction_id: int, db: Session = Depends(ge
     ]
 
 
-@router.delete("/{transaction_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_transaction(
+@router.post("/{transaction_id}/archive", response_model=TransactionOut)
+def archive_transaction(
     transaction_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(write_roles),
+    current_user: User = Depends(delete_roles),
 ):
     transaction = db.query(Transaction).filter(Transaction.id == transaction_id).first()
     if not transaction:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
+    if transaction.is_archived:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Transaction is already archived")
+
+    transaction.is_archived = True
+    transaction.archived_at = datetime.utcnow()
+    transaction.archived_by = current_user.id
+    record_audit(
+        db,
+        action="TRANSACTION_ARCHIVED",
+        entity="Transaction",
+        entity_id=transaction.transaction_code,
+        user_id=current_user.id,
+        metadata={"reason": "Transaction archived by authorized administrator"},
+    )
+    db.commit()
+    db.refresh(transaction)
+    return serialize_transaction(db, transaction)
+
+
+@router.delete("/{transaction_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_transaction(
+    transaction_id: int,
+    payload: TransactionDeletionRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(delete_roles),
+):
+    transaction = db.query(Transaction).filter(Transaction.id == transaction_id).first()
+    if not transaction:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
+    reason = payload.reason.strip()
+    if not reason:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A deletion reason is required.",
+        )
+    if transaction.status == "COMPLETED":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Completed transactions cannot be permanently deleted. Archive this transaction instead.",
+        )
 
     parcel_id = transaction.parcel_id
     transaction_code = transaction.transaction_code
 
-    # Remove linked evidence and evidence review records
-    evidence_items = db.query(Evidence).filter(Evidence.transaction_id == transaction_id).all()
-    for ev in evidence_items:
-        db.query(EvidenceReviewHistory).filter(EvidenceReviewHistory.evidence_id == ev.id).delete(synchronize_session=False)
-        db.delete(ev)
+    try:
+        evidence_ids = [
+            evidence_id
+            for evidence_id, in db.query(Evidence.id)
+            .filter(Evidence.transaction_id == transaction_id)
+            .all()
+        ]
+        if evidence_ids:
+            db.query(EvidenceReviewHistory).filter(
+                EvidenceReviewHistory.evidence_id.in_(evidence_ids)
+            ).delete(synchronize_session=False)
+        db.query(Evidence).filter(
+            Evidence.transaction_id == transaction_id
+        ).delete(synchronize_session=False)
 
-    # Remove linked review cases, risk predictions, status history, and verification records
-    db.query(CaseReview).filter(CaseReview.transaction_id == transaction_id).delete(synchronize_session=False)
-    db.query(RiskPrediction).filter(RiskPrediction.transaction_id == transaction_id).delete(synchronize_session=False)
-    db.query(TransactionStatusHistory).filter(TransactionStatusHistory.transaction_id == transaction_id).delete(synchronize_session=False)
-    db.query(VerificationResultRecord).filter(VerificationResultRecord.transaction_id == transaction_id).delete(synchronize_session=False)
+        case_ids = [
+            case_id
+            for case_id, in db.query(CaseReview.id)
+            .filter(CaseReview.transaction_id == transaction_id)
+            .all()
+        ]
+        if case_ids:
+            db.query(CaseStatusHistory).filter(
+                CaseStatusHistory.case_id.in_(case_ids)
+            ).delete(synchronize_session=False)
+        db.query(CaseReview).filter(
+            CaseReview.transaction_id == transaction_id
+        ).delete(synchronize_session=False)
+        db.query(RiskPrediction).filter(
+            RiskPrediction.transaction_id == transaction_id
+        ).delete(synchronize_session=False)
+        db.query(TransactionStatusHistory).filter(
+            TransactionStatusHistory.transaction_id == transaction_id
+        ).delete(synchronize_session=False)
+        db.query(VerificationResultRecord).filter(
+            VerificationResultRecord.transaction_id == transaction_id
+        ).delete(synchronize_session=False)
 
-    # Delete transaction
-    db.delete(transaction)
-    db.flush()
+        db.delete(transaction)
+        db.flush()
 
-    # Recompute parcel pending transactions status
-    parcel = db.query(Parcel).filter(Parcel.id == parcel_id).first()
-    if parcel:
-        has_pending = (
-            db.query(Transaction)
-            .filter(
+        parcel = db.query(Parcel).filter(Parcel.id == parcel_id).first()
+        if parcel:
+            parcel.has_pending_transaction = db.query(Transaction).filter(
                 Transaction.parcel_id == parcel_id,
                 Transaction.status.in_(["PENDING", "UNDER_REVIEW", "FLAGGED"]),
-            )
-            .first()
-        ) is not None
-        parcel.has_pending_transaction = has_pending
+            ).first() is not None
 
-    record_audit(
-        db,
-        action="TRANSACTION_DELETED",
-        entity="Transaction",
-        entity_id=transaction_code,
-        user_id=current_user.id,
-        metadata={"reason": "Transaction removed by authorized user"},
-    )
-    db.commit()
-
+        record_audit(
+            db,
+            action="TRANSACTION_DELETED",
+            entity="Transaction",
+            entity_id=transaction_code,
+            user_id=current_user.id,
+            metadata={
+                "reason": reason,
+                "deletion_policy": "ADMIN_CONFIRMED_NON_COMPLETED_TRANSACTION",
+            },
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Transaction cannot be deleted because related records are still protected.",
+        ) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Transaction deletion failed and all changes were rolled back.",
+        ) from exc

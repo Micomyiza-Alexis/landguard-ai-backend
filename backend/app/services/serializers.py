@@ -132,6 +132,9 @@ def serialize_transaction(db: Session, item: Transaction) -> TransactionOut:
         created_by=item.created_by,
         created_at=item.created_at,
         updated_at=item.updated_at,
+        is_disposable=item.is_disposable,
+        is_archived=item.is_archived,
+        archived_at=item.archived_at,
         latest_risk_level=risk.risk_level if risk else None,
         latest_risk_score=risk.risk_score if risk else None,
     )

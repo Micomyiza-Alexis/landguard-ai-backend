@@ -20,9 +20,12 @@ from app.main import app
 from app.models.owner import Owner
 from app.models.ownership_history import OwnershipHistory
 from app.models.parcel import Parcel
+from app.models.risk_prediction import RiskPrediction
 from app.models.role import Role
+from app.models.transaction import Transaction
 from app.models.user import User
 from app.services.auth.service import create_auth_token
+from app.api.v1.routes import transactions as transaction_routes
 
 engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -52,14 +55,25 @@ def client():
 
 def _setup_data():
     db = TestingSessionLocal()
-    role = Role(name="OFFICER", description="Officer")
-    db.add(role)
+    roles = {
+        name: Role(name=name, description=name.title())
+        for name in ("ADMIN", "OFFICER", "AUDITOR")
+    }
+    db.add_all(roles.values())
     db.flush()
-    user = User(
+    officer = User(
         username="tx-officer", full_name="TX Officer", email="tx-officer@test.local",
-        password_hash=hash_password("OfficerPass123!"), is_active=True, roles=[role],
+        password_hash=hash_password("OfficerPass123!"), is_active=True, roles=[roles["OFFICER"]],
     )
-    db.add(user)
+    admin = User(
+        username="tx-admin", full_name="TX Admin", email="tx-admin@test.local",
+        password_hash=hash_password("AdminPass123!"), is_active=True, roles=[roles["ADMIN"]],
+    )
+    auditor = User(
+        username="tx-auditor", full_name="TX Auditor", email="tx-auditor@test.local",
+        password_hash=hash_password("AuditorPass123!"), is_active=True, roles=[roles["AUDITOR"]],
+    )
+    db.add_all([officer, admin, auditor])
     db.flush()
     seller = Owner(owner_code="OWN-TX-001", full_name="Seller One", status="ACTIVE")
     buyer = Owner(owner_code="OWN-TX-002", full_name="Buyer One", status="ACTIVE")
@@ -69,8 +83,14 @@ def _setup_data():
     )
     db.add_all([seller, buyer, parcel])
     db.commit()
-    token = create_auth_token(user)
-    ids = {"token": token, "parcel_id": parcel.id, "seller_id": seller.id, "buyer_id": buyer.id}
+    ids = {
+        "token": create_auth_token(officer, role="OFFICER"),
+        "admin_token": create_auth_token(admin, role="ADMIN"),
+        "auditor_token": create_auth_token(auditor, role="AUDITOR"),
+        "parcel_id": parcel.id,
+        "seller_id": seller.id,
+        "buyer_id": buyer.id,
+    }
     db.close()
     return ids
 
@@ -325,12 +345,28 @@ def test_pending_transaction_cannot_jump_to_completed(client):
 
 def test_delete_transaction(client):
     ids = _setup_data()
-    _record_initial_owner(ids)
-    transaction_id = _create_transaction_for_completion(client, ids)
+    db = TestingSessionLocal()
+    transaction = Transaction(
+        transaction_code="TX-DISPOSABLE-001",
+        parcel_id=ids["parcel_id"],
+        seller_owner_id=ids["seller_id"],
+        buyer_owner_id=ids["buyer_id"],
+        transaction_type="SALE",
+        transaction_date=datetime.utcnow(),
+        is_disposable=True,
+    )
+    db.add(transaction)
+    db.commit()
+    transaction_id = transaction.id
+    db.close()
 
-    # Delete transaction
-    headers = {"Authorization": f"Bearer {ids['token']}"}
-    response = client.delete(f"/api/transactions/{transaction_id}", headers=headers)
+    headers = {"Authorization": f"Bearer {ids['admin_token']}"}
+    response = client.request(
+        "DELETE",
+        f"/api/transactions/{transaction_id}",
+        headers=headers,
+        json={"reason": "Disposable test cleanup"},
+    )
     assert response.status_code == 204
 
     # Verify transaction is gone
@@ -338,7 +374,150 @@ def test_delete_transaction(client):
     assert get_res.status_code == 404
 
     # Non-existent deletion returns 404
-    del_404 = client.delete(f"/api/transactions/{transaction_id}", headers=headers)
+    del_404 = client.request(
+        "DELETE",
+        f"/api/transactions/{transaction_id}",
+        headers=headers,
+        json={"reason": "Disposable test cleanup"},
+    )
     assert del_404.status_code == 404
 
 
+def _create_disposable_transaction(ids, with_risk=False):
+    db = TestingSessionLocal()
+    transaction = Transaction(
+        transaction_code="TX-DISPOSABLE-002",
+        parcel_id=ids["parcel_id"],
+        seller_owner_id=ids["seller_id"],
+        buyer_owner_id=ids["buyer_id"],
+        transaction_type="SALE",
+        transaction_date=datetime.utcnow(),
+        is_disposable=True,
+    )
+    db.add(transaction)
+    db.flush()
+    if with_risk:
+        db.add(RiskPrediction(
+            transaction_id=transaction.id,
+            risk_score=15,
+            risk_level="LOW",
+            model_version="test",
+        ))
+    db.commit()
+    transaction_id = transaction.id
+    db.close()
+    return transaction_id
+
+
+def test_admin_deletes_disposable_transaction_with_predictions(client):
+    ids = _setup_data()
+    transaction_id = _create_disposable_transaction(ids, with_risk=True)
+
+    response = client.request(
+        "DELETE",
+        f"/api/transactions/{transaction_id}",
+        headers={"Authorization": f"Bearer {ids['admin_token']}"},
+        json={"reason": "Remove isolated disposable test transaction"},
+    )
+    assert response.status_code == 204
+
+    db = TestingSessionLocal()
+    try:
+        assert db.query(Transaction).filter_by(id=transaction_id).one_or_none() is None
+        assert db.query(RiskPrediction).filter_by(transaction_id=transaction_id).count() == 0
+    finally:
+        db.close()
+
+
+def test_admin_cannot_delete_genuine_transaction(client):
+    ids = _setup_data()
+    db = TestingSessionLocal()
+    transaction = Transaction(
+        transaction_code="TX-GENUINE-001",
+        parcel_id=ids["parcel_id"],
+        transaction_type="SALE",
+        transaction_date=datetime.utcnow(),
+        status="COMPLETED",
+    )
+    db.add(transaction)
+    db.commit()
+    transaction_id = transaction.id
+    db.close()
+
+    response = client.request(
+        "DELETE",
+        f"/api/transactions/{transaction_id}",
+        headers={"Authorization": f"Bearer {ids['admin_token']}"},
+        json={"reason": "Attempted removal of protected completed record"},
+    )
+    assert response.status_code == 409
+    assert "archive" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize("token_key", ["token", "auditor_token"])
+def test_non_admin_cannot_delete_transaction(client, token_key):
+    ids = _setup_data()
+    transaction_id = _create_disposable_transaction(ids)
+    response = client.request(
+        "DELETE",
+        f"/api/transactions/{transaction_id}",
+        headers={"Authorization": f"Bearer {ids[token_key]}"},
+        json={"reason": "Unauthorized deletion attempt"},
+    )
+    assert response.status_code == 403
+
+
+def test_archive_preserves_transaction_and_predictions(client):
+    ids = _setup_data()
+    transaction_id = _create_disposable_transaction(ids, with_risk=True)
+
+    response = client.post(
+        f"/api/transactions/{transaction_id}/archive",
+        headers={"Authorization": f"Bearer {ids['admin_token']}"},
+    )
+    assert response.status_code == 200
+    assert response.json()["is_archived"] is True
+
+    db = TestingSessionLocal()
+    try:
+        assert db.query(Transaction).filter_by(id=transaction_id).one().is_archived is True
+        assert db.query(RiskPrediction).filter_by(transaction_id=transaction_id).count() == 1
+    finally:
+        db.close()
+
+
+def test_missing_transaction_delete_returns_404(client):
+    ids = _setup_data()
+    response = client.request(
+        "DELETE",
+        "/api/transactions/99999",
+        headers={"Authorization": f"Bearer {ids['admin_token']}"},
+        json={"reason": "Missing transaction test"},
+    )
+    assert response.status_code == 404
+
+
+def test_failed_delete_rolls_back_transaction_and_dependencies(client, monkeypatch):
+    ids = _setup_data()
+    transaction_id = _create_disposable_transaction(ids, with_risk=True)
+
+    def fail_audit(*args, **kwargs):
+        from sqlalchemy.exc import SQLAlchemyError
+
+        raise SQLAlchemyError("audit failure")
+
+    monkeypatch.setattr(transaction_routes, "record_audit", fail_audit)
+    response = client.request(
+        "DELETE",
+        f"/api/transactions/{transaction_id}",
+        headers={"Authorization": f"Bearer {ids['admin_token']}"},
+        json={"reason": "Rollback test"},
+    )
+    assert response.status_code == 500
+
+    db = TestingSessionLocal()
+    try:
+        assert db.query(Transaction).filter_by(id=transaction_id).one_or_none() is not None
+        assert db.query(RiskPrediction).filter_by(transaction_id=transaction_id).count() == 1
+    finally:
+        db.close()
