@@ -28,25 +28,33 @@ def create_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("ADMIN")),
 ):
-    username = payload.username or payload.email.split("@")[0]
-    existing = db.query(User).filter((User.email == payload.email) | (User.username == username)).first()
-    if existing:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User already exists")
+    clean_email = payload.email.strip().lower()
+    username = (payload.username or "").strip() or clean_email.split("@")[0]
+
+    existing_email = db.query(User).filter(User.email.ilike(clean_email)).first()
+    if existing_email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email is already registered")
+
+    existing_user = db.query(User).filter(User.username.ilike(username)).first()
+    if existing_user:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Username '{username}' is already taken")
+
+    role_name = payload.role.value if hasattr(payload.role, "value") else str(payload.role)
+    role = db.query(Role).filter(Role.name == role_name).first()
+    if role is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="User role is not configured")
 
     user = User(
         username=username,
-        full_name=payload.full_name,
-        email=payload.email,
+        full_name=payload.full_name.strip(),
+        email=clean_email,
         password_hash=hash_password(payload.password),
         is_active=payload.is_active,
     )
-    role = db.query(Role).filter(Role.name == payload.role.value).first()
-    if role is None:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="User role is not configured")
     user.roles.append(role)
     db.add(user)
     db.flush()
-    record_audit(db, action="USER_CREATED", entity="User", entity_id=str(user.id), user_id=current_user.id, metadata={"role": payload.role.value})
+    record_audit(db, action="USER_CREATED", entity="User", entity_id=str(user.id), user_id=current_user.id, metadata={"role": role_name})
     db.commit()
     db.refresh(user)
     return user
@@ -73,17 +81,43 @@ def update_user(
 
     data = payload.model_dump(exclude_unset=True)
     new_role = data.pop("role", None)
+    new_password = data.pop("password", None)
+
+    if "email" in data and data["email"]:
+        clean_email = data["email"].strip().lower()
+        data["email"] = clean_email
+        conflict = db.query(User).filter(User.email.ilike(clean_email), User.id != user.id).first()
+        if conflict:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email is already registered")
+
+    if "username" in data and data["username"]:
+        clean_username = data["username"].strip()
+        data["username"] = clean_username
+        conflict = db.query(User).filter(User.username.ilike(clean_username), User.id != user.id).first()
+        if conflict:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username is already taken")
+
+    if new_password:
+        user.password_hash = hash_password(new_password)
+
     for field, value in data.items():
-        setattr(user, field, value)
+        if value is not None:
+            if isinstance(value, str):
+                value = value.strip()
+            setattr(user, field, value)
+
     if new_role:
-        role = db.query(Role).filter(Role.name == new_role.value).first()
+        role_name = new_role.value if hasattr(new_role, "value") else str(new_role)
+        role = db.query(Role).filter(Role.name == role_name).first()
         if role is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown role")
         user.roles = [role]
+
     record_audit(db, action="USER_UPDATED", entity="User", entity_id=str(user.id), user_id=current_user.id)
     db.commit()
     db.refresh(user)
     return user
+
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)

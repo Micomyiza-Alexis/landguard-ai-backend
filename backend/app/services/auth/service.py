@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.security import create_access_token, decode_access_token, verify_password
 from app.db.session import get_db
 from app.models.user import User
+from app.models.user_session import UserSession
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
@@ -52,6 +53,53 @@ def reset_failed_logins(db: Session, user: User) -> None:
     user.last_failed_login = None
 
 
+def create_user_session(
+    db: Session,
+    user: User,
+    token: str,
+    expires_at: datetime,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> UserSession:
+    """Create a session record for a newly issued access token."""
+    session = UserSession(
+        token=token,
+        user_id=user.id,
+        created_at=datetime.utcnow(),
+        expires_at=expires_at,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        revoked=False,
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+    return session
+
+
+def revoke_user_sessions(db: Session, user_id: int) -> None:
+    """Revoke all active sessions for a user."""
+    sessions = (
+        db.query(UserSession)
+        .filter(UserSession.user_id == user_id, UserSession.revoked == False)
+        .all()
+    )
+    for item in sessions:
+        item.revoked = True
+    db.commit()
+
+
+def list_user_sessions(db: Session, user_id: int) -> list[UserSession]:
+    """List active (not revoked, not expired) sessions for a user."""
+    now = datetime.utcnow()
+    return (
+        db.query(UserSession)
+        .filter(UserSession.user_id == user_id, UserSession.revoked == False, UserSession.expires_at > now)
+        .order_by(UserSession.created_at.desc())
+        .all()
+    )
+
+
 def create_auth_token(user: User, role: str | None = None) -> str:
     expires_delta = timedelta(minutes=60)
     if role is None:
@@ -76,6 +124,16 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User account is disabled")
+
+    jti = payload.get("jti")
+    if jti:
+        user_session = (
+            db.query(UserSession)
+            .filter(UserSession.token == jti, UserSession.user_id == user.id)
+            .first()
+        )
+        if user_session is not None and (user_session.revoked or user_session.expires_at < datetime.utcnow()):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session revoked or expired")
     return user
 
 

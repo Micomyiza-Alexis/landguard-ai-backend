@@ -104,3 +104,74 @@ def test_officer_cannot_list_users():
     db.close()
     response = client.get("/api/users", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 403
+
+
+def test_admin_can_create_user_with_lowercase_role_and_auto_username():
+    token = _admin_token()
+    response = client.post(
+        "/api/users",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "full_name": "Auditor User",
+            "email": "auditor2@example.com",
+            "username": "",
+            "password": "Password123!",
+            "role": "auditor",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["roles"][0]["name"] == "AUDITOR"
+    assert data["username"] == "auditor2"
+
+
+def test_admin_cannot_create_duplicate_user():
+    token = _admin_token()
+    response = client.post(
+        "/api/users",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "full_name": "Admin Dupe",
+            "email": "admin@example.com",
+            "password": "Password123!",
+            "role": "ADMIN",
+        },
+    )
+    assert response.status_code == 400
+    assert "Email is already registered" in response.json()["detail"]
+
+
+def test_admin_can_update_and_reactivate_user():
+    token = _admin_token()
+    # Create user
+    res = client.post(
+        "/api/users",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "full_name": "Target User",
+            "email": "target@example.com",
+            "password": "InitialPass123",
+            "role": "OFFICER",
+        },
+    )
+    assert res.status_code == 200
+    user_id = res.json()["id"]
+
+    # Update role and password
+    up_res = client.put(
+        f"/api/users/{user_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"role": "AUDITOR", "password": "UpdatedPass123"},
+    )
+    assert up_res.status_code == 200
+    assert up_res.json()["roles"][0]["name"] == "AUDITOR"
+
+    # Deactivate user
+    del_res = client.delete(f"/api/users/{user_id}", headers={"Authorization": f"Bearer {token}"})
+    assert del_res.status_code == 204
+
+    # Reactivate user
+    react_res = client.post(f"/api/users/{user_id}/reactivate", headers={"Authorization": f"Bearer {token}"})
+    assert react_res.status_code == 200
+    assert react_res.json()["is_active"] is True
+

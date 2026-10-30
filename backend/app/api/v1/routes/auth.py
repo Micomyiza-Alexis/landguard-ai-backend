@@ -1,23 +1,35 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
-from app.core.security import hash_password
+from app.core.config import settings
+from app.core.security import decode_access_token, hash_password, verify_password
 from app.db.session import get_db
 from app.models.role import Role
 from app.models.user import User
-from app.schemas.auth import LoginRequest, TokenResponse
+from app.schemas.auth import ChangePasswordRequest, LoginRequest, TokenResponse
 from app.schemas.domain import ProfileUpdate
 from app.schemas.user import UserCreate, UserOut
 from app.services.audit.service import record_audit
-from app.services.auth.service import authenticate_user, create_auth_token, get_current_user, require_roles, is_account_locked, record_failed_login, reset_failed_logins
+from app.services.auth.service import (
+    authenticate_user,
+    create_auth_token,
+    create_user_session,
+    get_current_user,
+    is_account_locked,
+    list_user_sessions,
+    record_failed_login,
+    require_roles,
+    reset_failed_logins,
+    revoke_user_sessions,
+)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
 @router.post("/login", response_model=TokenResponse)
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
+def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)):
     try:
         identifier = payload.identifier()
     except ValueError as exc:
@@ -80,6 +92,15 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
     reset_failed_logins(db, user)
     token = create_auth_token(user, role=payload.role.value)
+    token_claims = decode_access_token(token)
+    create_user_session(
+        db,
+        user=user,
+        token=str(token_claims.get("jti") or token),
+        expires_at=datetime.utcnow() + timedelta(minutes=settings.jwt_access_token_expire_minutes),
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
     record_audit(
         db,
         action="LOGIN",
@@ -93,9 +114,49 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 @router.post("/logout")
 def logout(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    revoke_user_sessions(db, current_user.id)
     record_audit(db, action="LOGOUT", entity="User", entity_id=str(current_user.id), user_id=current_user.id)
     db.commit()
     return {"message": "Signed out"}
+
+
+@router.post("/change-password")
+def change_password(
+    payload: ChangePasswordRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not verify_password(payload.current_password, current_user.password_hash):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
+
+    current_user.password_hash = hash_password(payload.new_password)
+    revoke_user_sessions(db, current_user.id)
+    record_audit(
+        db,
+        action="PASSWORD_CHANGED",
+        entity="User",
+        entity_id=str(current_user.id),
+        user_id=current_user.id,
+        details="Password changed; all sessions revoked",
+    )
+    db.commit()
+    return {"message": "Password updated successfully"}
+
+
+@router.get("/sessions")
+def list_my_sessions(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    sessions = list_user_sessions(db, current_user.id)
+    return [
+        {
+            "id": item.id,
+            "created_at": item.created_at.isoformat(),
+            "expires_at": item.expires_at.isoformat(),
+            "ip_address": item.ip_address,
+            "user_agent": item.user_agent,
+            "revoked": item.revoked,
+        }
+        for item in sessions
+    ]
 
 
 @router.get("/me")

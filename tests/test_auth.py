@@ -229,3 +229,83 @@ def test_login_token_contains_selected_role(client):
     assert response.status_code == 200
     claims = decode_access_token(response.json()["access_token"])
     assert claims["role"] == "OFFICER"
+
+
+def test_change_password_requires_auth(client):
+    response = client.post(
+        "/api/auth/change-password",
+        json={"current_password": "OfficerPass123!", "new_password": "NewPass123!"},
+    )
+    assert response.status_code == 401
+
+
+def test_change_password_wrong_current_password_rejected(client):
+    _create_user("changepw1", "changepw1@test.local", "OfficerPass123!", "OFFICER")
+    login_resp = client.post(
+        "/api/auth/login",
+        json={"email": "changepw1@test.local", "password": "OfficerPass123!", "role": "OFFICER"},
+    )
+    token = login_resp.json()["access_token"]
+
+    response = client.post(
+        "/api/auth/change-password",
+        json={"current_password": "WrongCurrentPass!", "new_password": "NewPass123!"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 400
+
+
+def test_change_password_updates_password_and_revokes_sessions(client):
+    _create_user("changepw2", "changepw2@test.local", "OfficerPass123!", "OFFICER")
+    login_resp = client.post(
+        "/api/auth/login",
+        json={"email": "changepw2@test.local", "password": "OfficerPass123!", "role": "OFFICER"},
+    )
+    token = login_resp.json()["access_token"]
+
+    response = client.post(
+        "/api/auth/change-password",
+        json={"current_password": "OfficerPass123!", "new_password": "NewPass123!"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    assert response.json()["message"] == "Password updated successfully"
+
+    # Old session must now be rejected after password change.
+    me_resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert me_resp.status_code == 401
+
+    # New password must work for a fresh login.
+    relogin = client.post(
+        "/api/auth/login",
+        json={"email": "changepw2@test.local", "password": "NewPass123!", "role": "OFFICER"},
+    )
+    assert relogin.status_code == 200
+
+
+def test_view_sessions_lists_and_logout_revokes(client):
+    _create_user("sessuser1", "sessuser@test.local", "OfficerPass123!", "OFFICER")
+    login_resp = client.post(
+        "/api/auth/login",
+        json={"email": "sessuser@test.local", "password": "OfficerPass123!", "role": "OFFICER"},
+    )
+    token = login_resp.json()["access_token"]
+
+    sessions_resp = client.get(
+        "/api/auth/sessions",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert sessions_resp.status_code == 200
+    sessions_data = sessions_resp.json()
+    assert isinstance(sessions_data, list)
+    assert len(sessions_data) >= 1
+    assert sessions_data[0]["revoked"] is False
+
+    logout_resp = client.post(
+        "/api/auth/logout",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert logout_resp.status_code == 200
+
+    me_resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert me_resp.status_code == 401
