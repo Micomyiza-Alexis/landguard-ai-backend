@@ -321,3 +321,24 @@ def test_pending_transaction_cannot_jump_to_completed(client):
         )
     finally:
         db.close()
+
+
+def test_delete_transaction(client):
+    ids = _setup_data()
+    _record_initial_owner(ids)
+    transaction_id = _create_transaction_for_completion(client, ids)
+
+    # Delete transaction
+    headers = {"Authorization": f"Bearer {ids['token']}"}
+    response = client.delete(f"/api/transactions/{transaction_id}", headers=headers)
+    assert response.status_code == 204
+
+    # Verify transaction is gone
+    get_res = client.get(f"/api/transactions/{transaction_id}", headers=headers)
+    assert get_res.status_code == 404
+
+    # Non-existent deletion returns 404
+    del_404 = client.delete(f"/api/transactions/{transaction_id}", headers=headers)
+    assert del_404.status_code == 404
+
+

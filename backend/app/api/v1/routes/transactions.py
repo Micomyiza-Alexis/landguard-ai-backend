@@ -6,9 +6,13 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
+from app.models.case_review import CaseReview
+from app.models.evidence import Evidence, EvidenceReviewHistory
+
 from app.models.owner import Owner
 from app.models.ownership_history import OwnershipHistory
 from app.models.parcel import Parcel
+from app.models.risk_prediction import RiskPrediction
 from app.models.transaction import Transaction, TRANSACTION_STATUSES
 from app.models.transaction_status_history import TransactionStatusHistory
 from app.models.user import User
@@ -22,6 +26,7 @@ from app.core.transaction_status import TransactionStatus
 router = APIRouter(prefix="/transactions", tags=["Transactions"])
 write_roles = require_roles("ADMIN", "OFFICER")
 read_roles = require_roles("ADMIN", "OFFICER", "AUDITOR")
+
 
 
 class TransactionStatusUpdate(BaseModel):
@@ -284,3 +289,57 @@ def get_transaction_status_history(transaction_id: int, db: Session = Depends(ge
         }
         for row in rows
     ]
+
+
+@router.delete("/{transaction_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_transaction(
+    transaction_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(write_roles),
+):
+    transaction = db.query(Transaction).filter(Transaction.id == transaction_id).first()
+    if not transaction:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
+
+    parcel_id = transaction.parcel_id
+    transaction_code = transaction.transaction_code
+
+    # Remove linked evidence and evidence review records
+    evidence_items = db.query(Evidence).filter(Evidence.transaction_id == transaction_id).all()
+    for ev in evidence_items:
+        db.query(EvidenceReviewHistory).filter(EvidenceReviewHistory.evidence_id == ev.id).delete(synchronize_session=False)
+        db.delete(ev)
+
+    # Remove linked review cases, risk predictions, status history, and verification records
+    db.query(CaseReview).filter(CaseReview.transaction_id == transaction_id).delete(synchronize_session=False)
+    db.query(RiskPrediction).filter(RiskPrediction.transaction_id == transaction_id).delete(synchronize_session=False)
+    db.query(TransactionStatusHistory).filter(TransactionStatusHistory.transaction_id == transaction_id).delete(synchronize_session=False)
+    db.query(VerificationResultRecord).filter(VerificationResultRecord.transaction_id == transaction_id).delete(synchronize_session=False)
+
+    # Delete transaction
+    db.delete(transaction)
+    db.flush()
+
+    # Recompute parcel pending transactions status
+    parcel = db.query(Parcel).filter(Parcel.id == parcel_id).first()
+    if parcel:
+        has_pending = (
+            db.query(Transaction)
+            .filter(
+                Transaction.parcel_id == parcel_id,
+                Transaction.status.in_(["PENDING", "UNDER_REVIEW", "FLAGGED"]),
+            )
+            .first()
+        ) is not None
+        parcel.has_pending_transaction = has_pending
+
+    record_audit(
+        db,
+        action="TRANSACTION_DELETED",
+        entity="Transaction",
+        entity_id=transaction_code,
+        user_id=current_user.id,
+        metadata={"reason": "Transaction removed by authorized user"},
+    )
+    db.commit()
+
