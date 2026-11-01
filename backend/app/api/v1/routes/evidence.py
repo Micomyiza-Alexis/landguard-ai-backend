@@ -17,6 +17,7 @@ from app.models.user import User
 from app.schemas.evidence import EvidenceOut, EvidenceReviewRequest, EvidenceReviewHistoryOut
 from app.services.audit.service import record_audit
 from app.services.auth.service import require_roles
+from app.services.settings.service import get_file_storage_policy
 
 router = APIRouter(prefix="/evidence", tags=["Evidence"])
 write_roles = require_roles("ADMIN", "OFFICER")
@@ -86,7 +87,8 @@ async def upload_evidence(
     content = await file.read()
     file_size = len(content)
 
-    max_size = settings.max_evidence_file_size
+    max_size_mb = get_file_storage_policy(db)["max_file_size_mb"]
+    max_size = int(float(max_size_mb) * 1024 * 1024)
     if file_size > max_size:
         raise HTTPException(
             status_code=400,

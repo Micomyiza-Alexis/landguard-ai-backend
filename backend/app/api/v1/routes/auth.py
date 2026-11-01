@@ -3,7 +3,6 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.core.security import decode_access_token, hash_password, verify_password
 from app.db.session import get_db
 from app.models.role import Role
@@ -24,6 +23,7 @@ from app.services.auth.service import (
     reset_failed_logins,
     revoke_user_sessions,
 )
+from app.services.settings.service import get_security_policy
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -44,7 +44,12 @@ def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)
         .first()
     )
 
-    if existing_user and is_account_locked(existing_user):
+    security_policy = get_security_policy(db)
+    if existing_user and is_account_locked(
+        existing_user,
+        max_attempts=security_policy["max_failed_logins"],
+        lockout_minutes=security_policy["lockout_minutes"],
+    ):
         record_audit(
             db,
             action="LOGIN_LOCKED",
@@ -91,13 +96,13 @@ def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)
         )
 
     reset_failed_logins(db, user)
-    token = create_auth_token(user, role=payload.role.value)
+    token = create_auth_token(user, role=payload.role.value, db=db)
     token_claims = decode_access_token(token)
     create_user_session(
         db,
         user=user,
         token=str(token_claims.get("jti") or token),
-        expires_at=datetime.utcnow() + timedelta(minutes=settings.jwt_access_token_expire_minutes),
+        expires_at=datetime.utcnow() + timedelta(minutes=security_policy["jwt_expiry_minutes"]),
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
     )
@@ -128,6 +133,14 @@ def change_password(
 ):
     if not verify_password(payload.current_password, current_user.password_hash):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
+
+    security_policy = get_security_policy(db)
+    min_password_length = security_policy["min_password_length"]
+    if len(payload.new_password) < min_password_length:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"New password must be at least {min_password_length} characters long.",
+        )
 
     current_user.password_hash = hash_password(payload.new_password)
     revoke_user_sessions(db, current_user.id)

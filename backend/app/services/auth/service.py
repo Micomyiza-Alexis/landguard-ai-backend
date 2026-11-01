@@ -10,6 +10,7 @@ from app.core.security import create_access_token, decode_access_token, verify_p
 from app.db.session import get_db
 from app.models.user import User
 from app.models.user_session import UserSession
+from app.services.settings.service import get_security_policy
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
@@ -30,11 +31,17 @@ def authenticate_user(db: Session, identifier: str, password: str) -> Optional[U
     return user
 
 
-def is_account_locked(user: User) -> bool:
+def is_account_locked(
+    user: User,
+    max_attempts: int | None = None,
+    lockout_minutes: int | None = None,
+) -> bool:
     """Check if user account is temporarily locked due to failed attempts."""
-    if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
+    max_failed = max_attempts if max_attempts is not None else 5
+    lockout_duration = lockout_minutes if lockout_minutes is not None else 30
+    if user.failed_login_attempts >= max_failed:
         if user.last_failed_login:
-            lockout_end = user.last_failed_login + timedelta(minutes=LOCKOUT_DURATION_MINUTES)
+            lockout_end = user.last_failed_login + timedelta(minutes=lockout_duration)
             if datetime.utcnow() < lockout_end:
                 return True
     return False
@@ -100,8 +107,9 @@ def list_user_sessions(db: Session, user_id: int) -> list[UserSession]:
     )
 
 
-def create_auth_token(user: User, role: str | None = None) -> str:
-    expires_delta = timedelta(minutes=60)
+def create_auth_token(user: User, role: str | None = None, db: Session | None = None) -> str:
+    policy = get_security_policy(db)
+    expires_delta = timedelta(minutes=policy["jwt_expiry_minutes"])
     if role is None:
         # Preserve compatibility for internal callers and existing tests.
         role = sorted(user_role.name for user_role in user.roles)[0] if user.roles else None

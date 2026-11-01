@@ -16,6 +16,7 @@ from app.api.v1.routes.parcels import router as parcels_router
 from app.api.v1.routes.public import router as public_router
 from app.api.v1.routes.reports import router as reports_router
 from app.api.v1.routes.risk import router as risk_router
+from app.api.v1.routes.settings import router as settings_router
 from app.api.v1.routes.transactions import router as transactions_router
 from app.api.v1.routes.users import router as users_router
 from app.api.v1.routes.verification import router as verification_router
@@ -72,6 +73,7 @@ api_routers = [
     reports_router,
     public_router,
     evidence_router,
+    settings_router,
 ]
 for router in api_routers:
     app.include_router(router, prefix="/api")
