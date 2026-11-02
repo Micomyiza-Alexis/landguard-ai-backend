@@ -97,6 +97,7 @@ def _setup_data():
 
 def test_create_transaction_success(client):
     ids = _setup_data()
+    _record_initial_owner(ids)
     response = client.post("/api/transactions", headers={"Authorization": f"Bearer {ids['token']}"}, json={
         "parcel_id": ids["parcel_id"], "seller_owner_id": ids["seller_id"], "buyer_owner_id": ids["buyer_id"],
         "transaction_type": "SALE", "transaction_date": datetime.utcnow().isoformat(),
@@ -128,6 +129,7 @@ def test_create_transaction_nonexistent_seller(client):
 
 def test_list_transactions(client):
     ids = _setup_data()
+    _record_initial_owner(ids)
     client.post("/api/transactions", headers={"Authorization": f"Bearer {ids['token']}"}, json={
         "parcel_id": ids["parcel_id"], "seller_owner_id": ids["seller_id"], "buyer_owner_id": ids["buyer_id"],
         "transaction_type": "SALE", "transaction_date": datetime.utcnow().isoformat(),
@@ -141,6 +143,7 @@ def test_list_transactions(client):
 
 def test_get_transaction_by_id(client):
     ids = _setup_data()
+    _record_initial_owner(ids)
     create_resp = client.post("/api/transactions", headers={"Authorization": f"Bearer {ids['token']}"}, json={
         "parcel_id": ids["parcel_id"], "seller_owner_id": ids["seller_id"], "buyer_owner_id": ids["buyer_id"],
         "transaction_type": "SALE", "transaction_date": datetime.utcnow().isoformat(),
@@ -160,6 +163,7 @@ def test_get_nonexistent_transaction(client):
 
 def test_stored_verification_empty(client):
     ids = _setup_data()
+    _record_initial_owner(ids)
     create_resp = client.post("/api/transactions", headers={"Authorization": f"Bearer {ids['token']}"}, json={
         "parcel_id": ids["parcel_id"], "seller_owner_id": ids["seller_id"], "buyer_owner_id": ids["buyer_id"],
         "transaction_type": "SALE", "transaction_date": datetime.utcnow().isoformat(),
@@ -264,9 +268,23 @@ def test_completed_transfer_appends_ownership_history(client):
 
 def test_completed_transfer_rejects_seller_not_latest_owner(client):
     ids = _setup_data()
-    _record_initial_owner(ids, owner_id=ids["buyer_id"])
+    _record_initial_owner(ids)
+
     transaction_id = _create_transaction_for_completion(client, ids)
     _approve_transaction(client, ids, transaction_id)
+
+    # Simulate ownership changing after transaction approval.
+    db = TestingSessionLocal()
+    try:
+        ownership = (
+            db.query(OwnershipHistory)
+            .filter(OwnershipHistory.parcel_id == ids["parcel_id"])
+            .one()
+        )
+        ownership.new_owner_id = ids["buyer_id"]
+        db.commit()
+    finally:
+        db.close()
 
     response = _set_transaction_status(
         client, ids, transaction_id, "COMPLETED"
@@ -280,6 +298,7 @@ def test_completed_transfer_rejects_seller_not_latest_owner(client):
 
         transaction = db.query(Transaction).filter_by(id=transaction_id).one()
         assert transaction.status == "APPROVED"
+
         assert (
             db.query(OwnershipHistory)
             .filter_by(parcel_id=ids["parcel_id"])
@@ -292,12 +311,27 @@ def test_completed_transfer_rejects_seller_not_latest_owner(client):
 
 def test_completed_transfer_requires_established_ownership(client):
     ids = _setup_data()
+
+    # Establish ownership so transaction creation is valid.
+    _record_initial_owner(ids)
+
     transaction_id = _create_transaction_for_completion(client, ids)
     _approve_transaction(client, ids, transaction_id)
+
+    # Simulate missing ownership record before completion.
+    db = TestingSessionLocal()
+    try:
+        db.query(OwnershipHistory).filter(
+            OwnershipHistory.parcel_id == ids["parcel_id"]
+        ).delete()
+        db.commit()
+    finally:
+        db.close()
 
     response = _set_transaction_status(
         client, ids, transaction_id, "COMPLETED"
     )
+
     assert response.status_code == 409
     assert "ownership is not established" in response.json()["detail"].lower()
 
@@ -307,6 +341,7 @@ def test_completed_transfer_requires_established_ownership(client):
 
         transaction = db.query(Transaction).filter_by(id=transaction_id).one()
         assert transaction.status == "APPROVED"
+
         assert (
             db.query(OwnershipHistory)
             .filter_by(parcel_id=ids["parcel_id"])
@@ -315,7 +350,6 @@ def test_completed_transfer_requires_established_ownership(client):
         )
     finally:
         db.close()
-
 
 def test_pending_transaction_cannot_jump_to_completed(client):
     ids = _setup_data()

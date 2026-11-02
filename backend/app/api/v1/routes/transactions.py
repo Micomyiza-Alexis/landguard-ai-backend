@@ -84,7 +84,14 @@ def create_transaction(
         Transaction.status.in_(["PENDING", "UNDER_REVIEW", "FLAGGED", "APPROVED"]),
     ).first():
         raise HTTPException(status_code=409, detail="Parcel already has an incompatible pending transaction")
+    # Validate the supplied seller ID before checking registered ownership.
+    if payload.seller_owner_id is not None:
+        supplied_seller = db.query(Owner).filter(
+            Owner.id == payload.seller_owner_id
+        ).first()
 
+        if not supplied_seller:
+            raise HTTPException(status_code=404, detail="Seller not found")
     latest_ownership = db.query(OwnershipHistory).filter(
         OwnershipHistory.parcel_id == parcel.id
     ).order_by(
