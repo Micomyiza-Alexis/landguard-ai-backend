@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.db.session import get_db
 from app.models.case_review import CaseReview, CaseStatusHistory
@@ -26,6 +27,7 @@ from app.core.transaction_status import TransactionStatus
 
 router = APIRouter(prefix="/transactions", tags=["Transactions"])
 write_roles = require_roles("ADMIN", "OFFICER")
+registration_roles = require_roles("OFFICER")
 delete_roles = require_roles("ADMIN")
 read_roles = require_roles("ADMIN", "OFFICER", "AUDITOR")
 
@@ -70,20 +72,37 @@ def list_transactions(
 def create_transaction(
     payload: TransactionCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(write_roles),
+    current_user: User = Depends(registration_roles),
 ):
-    if not db.query(Parcel).filter(Parcel.id == payload.parcel_id).first():
+    parcel = db.query(Parcel).filter(Parcel.id == payload.parcel_id).with_for_update().first()
+    if not parcel:
         raise HTTPException(status_code=404, detail="Parcel not found")
-    if payload.seller_owner_id and not db.query(Owner).filter(Owner.id == payload.seller_owner_id).first():
-        raise HTTPException(status_code=404, detail="Seller not found")
-    if payload.buyer_owner_id and not db.query(Owner).filter(Owner.id == payload.buyer_owner_id).first():
-        raise HTTPException(status_code=404, detail="Buyer not found")
+    if parcel.status.upper() != "ACTIVE":
+        raise HTTPException(status_code=409, detail="Only active parcels can receive transactions")
+    if parcel.has_pending_transaction or db.query(Transaction).filter(
+        Transaction.parcel_id == parcel.id,
+        Transaction.status.in_(["PENDING", "UNDER_REVIEW", "FLAGGED", "APPROVED"]),
+    ).first():
+        raise HTTPException(status_code=409, detail="Parcel already has an incompatible pending transaction")
 
-    if (
-        payload.seller_owner_id
-        and payload.buyer_owner_id
-        and payload.seller_owner_id == payload.buyer_owner_id
-    ):
+    latest_ownership = db.query(OwnershipHistory).filter(
+        OwnershipHistory.parcel_id == parcel.id
+    ).order_by(
+        OwnershipHistory.transfer_date.desc(),
+        OwnershipHistory.id.desc(),
+    ).first()
+    if not latest_ownership or not latest_ownership.new_owner_id:
+        raise HTTPException(status_code=409, detail="Parcel has no valid current registered owner")
+    seller_owner_id = latest_ownership.new_owner_id
+    if payload.seller_owner_id is not None and payload.seller_owner_id != seller_owner_id:
+        raise HTTPException(status_code=400, detail="Seller is determined by the parcel's current ownership record")
+
+    buyer = db.query(Owner).filter(Owner.id == payload.buyer_owner_id).first()
+    if not buyer:
+        raise HTTPException(status_code=404, detail="Buyer not found")
+    if buyer.status.upper() != "ACTIVE":
+        raise HTTPException(status_code=409, detail="Buyer must be an active owner")
+    if seller_owner_id == buyer.id:
         raise HTTPException(
             status_code=400,
             detail="Seller and buyer cannot be the same person",
@@ -93,14 +112,19 @@ def create_transaction(
         transaction_code=next_transaction_code(db),
         created_by=current_user.id,
         status=TransactionStatus.PENDING.value,
-        **payload.model_dump(),
+        parcel_id=parcel.id,
+        seller_owner_id=seller_owner_id,
+        buyer_owner_id=buyer.id,
+        transaction_type=payload.transaction_type,
+        transaction_date=payload.transaction_date,
+        declared_value=payload.declared_value,
+        supporting_reference=payload.supporting_reference,
     )
     db.add(item)
     db.flush()
 
     # Update parcel's has_pending_transaction flag
-    parcel = db.query(Parcel).filter(Parcel.id == payload.parcel_id).first()
-    if parcel and item.status == "PENDING":
+    if item.status == "PENDING":
         parcel.has_pending_transaction = True
         db.flush()
 
@@ -111,7 +135,14 @@ def create_transaction(
         entity_id=item.transaction_code,
         user_id=current_user.id,
     )
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Transaction could not be saved because a related record is invalid or already exists.",
+        ) from exc
     db.refresh(item)
     return serialize_transaction(db, item)
 

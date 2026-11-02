@@ -27,6 +27,7 @@ class Transaction(Base):
     transaction_type: Mapped[str] = mapped_column(String(100), nullable=False)
     transaction_date: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     declared_value: Mapped[Decimal | None] = mapped_column(Numeric(precision=18, scale=2), nullable=True)
+    supporting_reference: Mapped[str | None] = mapped_column(String(200), nullable=True)
     status: Mapped[str] = mapped_column(
         String(50),
         default=TransactionStatus.PENDING.value,

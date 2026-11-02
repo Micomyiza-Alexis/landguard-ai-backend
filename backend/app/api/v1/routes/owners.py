@@ -23,7 +23,11 @@ def list_owners(
     query = db.query(Owner)
     if q:
         like = f"%{q}%"
-        query = query.filter((Owner.full_name.ilike(like)) | (Owner.owner_code.ilike(like)))
+        query = query.filter(
+            (Owner.full_name.ilike(like))
+            | (Owner.owner_code.ilike(like))
+            | (Owner.identification_number.ilike(like))
+        )
     return [serialize_owner(db, item) for item in query.order_by(Owner.owner_code).all()]
 
 
@@ -35,6 +39,10 @@ def create_owner(
 ):
     if db.query(Owner).filter(Owner.owner_code == payload.owner_code).first():
         raise HTTPException(status_code=400, detail="Owner code already exists")
+    if payload.identification_number and db.query(Owner).filter(
+        Owner.identification_number == payload.identification_number
+    ).first():
+        raise HTTPException(status_code=409, detail="Identification number already exists")
     owner = Owner(**payload.model_dump())
     db.add(owner)
     db.flush()

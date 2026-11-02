@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from datetime import datetime
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -50,7 +51,14 @@ def create_parcel(
     db.add(parcel)
     db.flush()
     record_audit(db, action="PARCEL_CREATED", entity="Parcel", entity_id=parcel.parcel_code, user_id=current_user.id)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Parcel could not be saved because it conflicts with an existing record.",
+        ) from exc
     db.refresh(parcel)
     return serialize_parcel(db, parcel)
 
@@ -69,6 +77,20 @@ def get_parcel_by_upi(upi: str, db: Session = Depends(get_db), _current_user: Us
     if not parcel:
         raise HTTPException(status_code=404, detail="Parcel not found")
     return serialize_parcel(db, parcel)
+
+
+@router.get("/location-submissions", response_model=list[ParcelLocationSubmissionOut])
+def list_location_submissions(
+    status_filter: str = Query(default="PENDING_VERIFICATION", alias="status"),
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(require_roles("ADMIN")),
+):
+    return (
+        db.query(ParcelLocationSubmission)
+        .filter(ParcelLocationSubmission.status == status_filter)
+        .order_by(ParcelLocationSubmission.submitted_at.desc())
+        .all()
+    )
 
 
 @router.post("/{parcel_id}/location-submissions", response_model=ParcelLocationSubmissionOut, status_code=status.HTTP_201_CREATED)
@@ -131,6 +153,8 @@ def review_parcel_location(
         raise HTTPException(status_code=404, detail="Location submission not found")
     if submission.status != "PENDING_VERIFICATION":
         raise HTTPException(status_code=409, detail="Location submission has already been reviewed")
+    if payload.decision == "REJECTED" and not payload.review_notes:
+        raise HTTPException(status_code=400, detail="A rejection reason is required")
 
     parcel = db.query(Parcel).filter(Parcel.id == submission.parcel_id).first()
     if not parcel:

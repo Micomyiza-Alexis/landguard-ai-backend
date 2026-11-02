@@ -161,10 +161,11 @@ class OwnershipHistoryOut(BaseModel):
 class TransactionCreate(BaseModel):
     parcel_id: int
     seller_owner_id: Optional[int] = None
-    buyer_owner_id: Optional[int] = None
+    buyer_owner_id: int
     transaction_type: str
     transaction_date: datetime
     declared_value: Optional[Decimal] = None
+    supporting_reference: Optional[str] = None
 
 
 class TransactionOut(BaseModel):
@@ -183,6 +184,7 @@ class TransactionOut(BaseModel):
     archived_at: Optional[datetime] = None
     transaction_date: datetime
     declared_value: Optional[Decimal] = None
+    supporting_reference: Optional[str] = None
     status: str
     created_by: Optional[int] = None
     created_at: datetime

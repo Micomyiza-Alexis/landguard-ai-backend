@@ -128,6 +128,7 @@ def serialize_transaction(db: Session, item: Transaction) -> TransactionOut:
         transaction_type=item.transaction_type,
         transaction_date=item.transaction_date,
         declared_value=item.declared_value,
+        supporting_reference=item.supporting_reference,
         status=item.status,
         created_by=item.created_by,
         created_at=item.created_at,
